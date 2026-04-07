@@ -1,125 +1,107 @@
-"""
-Core agentic loop for TravelBuddy.
-Uses OpenAI gpt-4o with function calling.
-"""
-import json
-import os
-from openai import OpenAI
-from tools import TOOL_DEFINITIONS, dispatch_tool
-from prompts import SYSTEM_PROMPT
+from typing import Annotated
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from tools import search_flights, search_hotels, calculate_budget
+from config import MODEL_NAME, SYSTEM_PROMPT_PATH, VERBOSE
+from dotenv import load_dotenv
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-MODEL = "gpt-4o"
+load_dotenv()
 
+# 1. Đọc System Prompt
+try:
+    with open(SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
+        SYSTEM_PROMPT = f.read()
+except FileNotFoundError:
+    print(f"❌ Lỗi: Không tìm thấy {SYSTEM_PROMPT_PATH}")
+    exit(1)
 
-def run_agent_turn(conversation_history: list) -> tuple[str, list]:
-    """
-    Execute one full agentic turn (may involve multiple tool calls).
-    Returns (final_text_response, updated_history).
+# 2. Khai báo State
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
 
-    History format: list of OpenAI message dicts.
-    """
-    messages = conversation_history.copy()
+# 3. Khởi tạo LLM và Tools
+tools_list = [search_flights, search_hotels, calculate_budget]
+try:
+    llm = ChatOpenAI(model=MODEL_NAME)
+    llm_with_tools = llm.bind_tools(tools_list)
+    if VERBOSE:
+        print(f"✅ Initialized LLM: {MODEL_NAME}")
+except Exception as e:
+    print(f"❌ Lỗi khởi tạo LLM: {str(e)}")
+    exit(1)
 
-    iteration = 0
-    max_iterations = 20  # safety guard
+# 4. Agent Node with Error Handling
+def agent_node(state: AgentState):
+    messages = state["messages"]
+    if not isinstance(messages[0], SystemMessage):
+        messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+    
+    try:
+        response = llm_with_tools.invoke(messages)
+        
+        # === LOGGING ===
+        if VERBOSE and response.tool_calls:
+            for tc in response.tool_calls:
+                print(f"🔧 Tool: {tc['name']}({tc['args']})")
+        elif VERBOSE:
+            print(f"💬 Direct response (no tools needed)")
+        
+        return {"messages": [response]}
+    
+    except Exception as e:
+        print(f"❌ Lỗi agent: {str(e)}")
+        error_msg = HumanMessage(content=f"❌ Xin lỗi, có lỗi xảy ra: {str(e)}")
+        return {"messages": [error_msg]}
 
-    while iteration < max_iterations:
-        iteration += 1
+# 5. Xây dựng Graph
+builder = StateGraph(AgentState)
+builder.add_node("agent", agent_node)
 
-        response = client.chat.completions.create(
-            model=MODEL,
-            tools=TOOL_DEFINITIONS,
-            tool_choice="auto",
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
-            temperature=0.3,
-        )
+tool_node = ToolNode(tools_list)
+builder.add_node("tools", tool_node)
 
-        msg = response.choices[0].message
+# --- Khai báo edges ---
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", tools_condition)
+builder.add_edge("tools", "agent")
 
-        # Convert to serializable dict for history storage
-        assistant_msg = {"role": "assistant", "content": msg.content or ""}
-        if msg.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in msg.tool_calls
-            ]
+graph = builder.compile()
 
-        messages.append(assistant_msg)
-
-        # No tool calls → Claude is done
-        if not msg.tool_calls:
-            return msg.content or "", messages
-
-        # Process all tool calls
-        for tc in msg.tool_calls:
-            tool_name = tc.function.name
-            try:
-                tool_args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                tool_args = {}
-
-            # Display to user
-            print(f"\n  🔧 Đang gọi: {tool_name}")
-            _print_args_summary(tool_name, tool_args)
-
-            # Execute
-            try:
-                result = dispatch_tool(tool_name, tool_args)
-                result_str = json.dumps(result, ensure_ascii=False, indent=2)
-                _print_result_summary(tool_name, result)
-            except Exception as e:
-                result_str = json.dumps({"error": str(e)}, ensure_ascii=False)
-                print(f"  ❌ Lỗi: {e}")
-
-            # Each tool result is a separate message with role "tool"
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result_str,
-            })
-
-    # Max iterations reached
-    return "Xin lỗi, quá trình xử lý mất quá nhiều bước. Vui lòng thử lại.", messages
-
-
-def _print_args_summary(tool_name: str, args: dict) -> None:
-    """Print a concise summary of tool arguments."""
-    summaries = {
-        "search_flights": lambda a: f"     {a.get('origin_city')} → {a.get('destination_city')} | {a.get('departure_date')} | {a.get('num_passengers', 1)} khách",
-        "search_hotels": lambda a: f"     {a.get('city')} | {a.get('check_in_date')} → {a.get('check_out_date')}",
-        "check_budget": lambda a: f"     Ngân sách: ${a.get('total_budget_usd')} | Bay: ${a.get('planned_flight_cost', 0)} | KS: ${a.get('planned_hotel_cost', 0)}",
-        "optimize_trip": lambda a: f"     Điểm đến: {a.get('destination')} | {a.get('trip_dates', {}).get('num_nights')} đêm",
-    }
-    fn = summaries.get(tool_name)
-    if fn:
+# 6. Chat loop
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("🌍 TravelBuddy - Trợ Lý Du Lịch Thông Minh")
+    print("=" * 60)
+    print("💡 Gõ 'quit' hoặc 'exit' để thoát")
+    print("=" * 60 + "\n")
+    
+    while True:
         try:
-            print(fn(args))
-        except Exception:
-            pass
-
-
-def _print_result_summary(tool_name: str, result: dict) -> None:
-    """Print a concise summary of tool result."""
-    if "error" in result:
-        print(f"  ❌ {result['error']}")
-        return
-
-    if tool_name == "search_flights":
-        opts = result.get("options", [])
-        print(f"  ✅ Tìm thấy {len(opts)} chuyến bay | Rẻ nhất: ${result.get('cheapest_total_usd', '?')} ({result.get('cheapest_airline', '')})")
-    elif tool_name == "search_hotels":
-        opts = result.get("options", [])
-        print(f"  ✅ Tìm thấy {len(opts)} khách sạn tại {result.get('city', '')} | Từ ${result.get('cheapest_per_night_usd', '?')}/đêm")
-    elif tool_name == "check_budget":
-        print(f"  ✅ Còn lại: ${result.get('remaining_usd', '?')} | Trạng thái: {result.get('budget_status_emoji', '')} {result.get('budget_status', '')}")
-    elif tool_name == "optimize_trip":
-        combo = result.get("recommended_combination", {})
-        print(f"  ✅ Điểm tổng hợp: {combo.get('value_score', '?')}/10 | Đánh giá: {combo.get('fit_rating', '')}")
+            user_input = input("👤 Bạn: ").strip()
+            if user_input.lower() in ("quit", "exit", "q"):
+                print("👋 Cảm ơn bạn đã sử dụng TravelBuddy. Chúc bạn có một chuyến đi vui vẻ!")
+                break
+            
+            if not user_input:
+                print("⚠️  Vui lòng nhập câu hỏi của bạn.\n")
+                continue
+                
+            if VERBOSE:
+                print("\n⏳ TravelBuddy đang suy nghĩ...")
+            
+            try:
+                result = graph.invoke({"messages": [("human", user_input)]})
+                final = result["messages"][-1]
+                print(f"\n🤖 TravelBuddy: {final.content}\n")
+            except Exception as e:
+                print(f"❌ Lỗi khi xử lý: {str(e)}\n")
+        
+        except KeyboardInterrupt:
+            print("\n\n👋 Tạm biệt!")
+            break
+        except Exception as e:
+            print(f"❌ Lỗi: {str(e)}\n")
