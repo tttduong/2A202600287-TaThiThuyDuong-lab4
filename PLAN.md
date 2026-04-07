@@ -177,6 +177,7 @@ lab4_agent/
   - Có documentation đầy đủ
 
 💡 **Có thể mở rộng sau này:**
+- Thêm conversation history
 - Kết nối API thực (Skyscanner, Booking.com, vv)
 - Thêm tool: địa điểm du lịch, thời tiết, nhà hàng
 - Persistent conversation history (database)
